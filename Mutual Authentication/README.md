@@ -1,7 +1,7 @@
 
 # PUMA: Mutual Authentication and Key Establishment Phase
 
-This folder contains the socket-based PUMA mutual-authentication and key establishment benchmark for two Raspberry Pi 5 devices. The avatars exchange signed authentication messages, establish a fresh shared secret with ML-KEM, derive separate session and confirmation keys, and perform bilateral key confirmation.
+This folder contains the socket-based python programming for PUMA mutual-authentication and key establishment benchmark for two Raspberry Pi 5 devices. The avatars exchange signed authentication messages, establish a fresh shared secret with ML-KEM, derive separate session and confirmation keys, and perform bilateral key confirmation.
 
 ## Files
 
