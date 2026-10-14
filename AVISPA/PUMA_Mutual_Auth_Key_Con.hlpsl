@@ -1,0 +1,302 @@
+%PUMA: symbolic ML-KEM/FO with bilateral key confirmation.
+
+% WIRE MESSAGES (three messages; no fourth-message acknowledgement)
+% IdAv_A = Ka.Da; IdAv_B = Kb.Db; E = A's ephemeral encapsulation key.
+% AuthReq  = CertA.IdAv_A.IdAv_B.E.T1.Sign_A(IdAv_A.IdAv_B.E.T1)
+% AuthRes  = CertB.TagB.IdAv_B.IdAv_A.C.T2.Sign_B(IdAv_B.IdAv_A.C.T2)
+% AuthConf = TagA
+% Certificates are pre-issued ACA signatures on the avatar identities.
+% ML-DSA and certificate signatures are ideal symbolic signatures.
+
+% EXPLICIT CONFIRMATION SPECIFICATION
+% Ctx   = IdAv_A.IdAv_B.E.C.T1.T2, always in this initiator-first order.
+% Ks    = Kdf(K.Ls.Ctx)       -- HKDF(K, "Key-Session" || Ctx)
+% Kc    = Kdf(K.Lc.Ctx)       -- HKDF(K, "Key-Confirmation" || Ctx)
+% TagB  = Mac(Kc.Lb.Ctx)      -- HMAC(Kc, "KC-B-to-A" || Ctx)
+% TagA  = Mac(Kc.La.Ctx)      -- HMAC(Kc, "KC-A-to-B" || Ctx)
+% Ls,Lc,La,Lb are distinct public constants. The actual implementation
+% must use unambiguous encoding and the same HKDF salt/parameters at
+% both peers. Kdf and Mac are public, one-way symbolic constructors;
+% Mac(Kc.Data) abstracts an ideal keyed MAC, NOT SHA256(Kc || Data).
+% Computing a tag requires knowledge of its key and authenticated data.
+% HKDF internals, HMAC internals and concrete byte lengths are abstracted.
+
+% SYMBOLIC ML-KEM MAPPING (retained from supplied model)
+% KeyGen: E := new(); inv(E) abstracts the private decryption component;
+%         Z := new() abstracts the private implicit-rejection seed.
+% Encaps: M := new(); X = M.H(E); K = Gk(X); R = Gr(X); C = {M.R}_E.
+% Decaps: recover M,R; recompute Ccheck = {M.Gr(M.H(E))}_E.
+%         If C = Ccheck, return Gk(M.H(E)); otherwise return J(Z.C).
+% H,Gk,Gr,J are public. K is a derived message, not an independent nonce.
+% {M.R}_E is an ideal-PKE SURROGATE for K-PKE.Encrypt(E,M;R).
+% R is symbolic internal metadata, not an additional PUMA wire field
+% or a claim that real ML-KEM encrypts its coins as plaintext.
+% Only ciphertexts decomposable as {text.message}_E reach decapsulation.
+% Arbitrary invalid byte strings, input validation, decryption failure
+% probabilities, hash collisions, side channels and quantum queries are
+% outside the model. This is not computational verification of ML-KEM/FO.
+%
+% ACCEPTANCE
+% Both FO branches return a key and proceed to the SAME tag check.
+% A accepts only after verifying TagB and sending TagA (State = 5).
+% A bad TagB has no accepting transition and produces no AuthConf.
+% B's State = 1 means WAITING, not accepted. B accepts only after
+% receiving the correct TagA (State = 2).
+% A's completion does not guarantee delivery of TagA to B.
+% An FO mismatch does not itself send a public error; subsequent MAC
+% verification uses the locally derived fallback key in the same way.
+%
+% GOALS AND SCENARIO
+% req_agree: B authenticates A's signed request on E,T1.
+% res_agree: A authenticates B on E,T1,T2,K AFTER verifying TagB.
+% kc_b_to_a: A verifies B's possession/agreement on Ctx,Ks,Kc.
+% kc_a_to_b: B verifies A's possession/agreement on Ctx,Ks,Kc.
+% The confirmation goals use request/witness after the relevant check;
+% authentication_on includes AVISPA's replay/injectivity condition.
+% Secrecy is requested for raw K, derived Ks, and derived Kc.
+% Two honest A-B sessions plus A-i and i-B sessions are retained.
+% Sessions with i legitimately allow i to know their session secrets.
+
+
+% REFERENCES
+% ML-KEM: https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf
+% HKDF: https://www.rfc-editor.org/rfc/rfc5869
+% AVISPA: https://www.avispa-project.org/package/user-manual.pdf
+
+% INITIATOR ROLE: the first avatar A_{i,j}, represented by agent A.
+% A creates the ephemeral encapsulation key, sends AuthReq, processes
+% AuthRes, verifies B's confirmation tag, and finally sends AuthConf.
+% Ka/Kb are avatar authentication public keys; Kaca is the ACA public key.
+% Ka.Da and Kb.Db are the fixed initiator and responder avatar identities.
+% CertA is A's pre-issued ACA certificate. The functions and labels are
+% shared public parameters; SND/RCV are Dolev-Yao-controlled channels.
+role initiator(A,B: agent, Ka,Kb,Kaca: public_key,
+               Da,Db: text, CertA: message,
+               H,Gk,Gr,J,Kdf,Mac: hash_func,
+               Ls,Lc,La,Lb: text,
+               SND,RCV: channel(dy)) played_by A def=
+ % E: ephemeral encapsulation public key; Z: private rejection seed.
+ % M/R: recovered symbolic encapsulation material; C/Ccheck: received
+ % ciphertext and locally recomputed ciphertext. K is the raw KEM output.
+ % Ctx binds both identities, E, C, T1, and T2 in initiator-first order.
+ % Ks/Kc are the derived keys; TagB/TagBcheck are received/expected tags.
+ local State: nat, E: public_key, T1,T2,M,Z: text,
+       R,C,Ccheck,K,Ctx,Ks,Kc,TagB,TagBcheck: message
+ % States: 0=start, 1=await AuthRes, 2=FO check, 3=derive keys,
+ %         4=verify TagB, 5=locally accepted after sending AuthConf.
+ init State := 0
+ transition
+  % Message 1: fresh encapsulation key and destination-bound request.
+  % AuthReq_{i,j} = AC_{i,j} || IdAv_{i,j} || IdAv_{k,l} || E || T1
+  %                 || Sign_A(IdAv_{i,j} || IdAv_{k,l} || E || T1).
+  1. State = 0 /\ RCV(start) =|>
+     State' := 1 /\ E' := new() /\ Z' := new() /\ T1' := new()
+     % Generate new session-specific E, Z, T1 and send the signed request.
+     /\ SND(CertA.Ka.Da.Kb.Db.E'.T1'.
+            {Ka.Da.Kb.Db.E'.T1'}_inv(Ka))
+     % This witness is matched by B's req_agree request after verification.
+     /\ witness(A,B,req_agree,E'.T1')
+
+  % Message 2: verify certificate, identities and signature; store TagB.
+  % R' is unrestricted. Neither FO consistency nor MAC validity is
+  % assumed by this receive pattern.
+  % The fixed identities/public keys in RCV bind the response to this peer.
+  % The certificate pattern verifies the ACA signature on B's identity;
+  % the final pattern verifies B's signature on both identities, C, and T2.
+  2. State = 1 /\
+     RCV({Kb.Db}_inv(Kaca).TagB'.Kb.Db.Ka.Da.{M'.R'}_E.T2'.
+         {Kb.Db.Ka.Da.{M'.R'}_E.T2'}_inv(Kb)) =|>
+     % Store the received C and recompute its expected FO-style encryption.
+     State' := 2 /\ C' := {M'.R'}_E
+     /\ Ccheck' := {M'.Gr(M'.H(E))}_E
+     % Use the same ordered transcript fields at both peers.
+     /\ Ctx' := Ka.Da.Kb.Db.E.C'.T1.T2'
+
+  % FO consistency succeeds: derive the raw shared secret.
+  % Equality of ciphertexts selects the successful decapsulation branch.
+  % The raw KEM secret is recorded separately from the derived session key.
+  3. State = 2 /\ C = Ccheck --|>
+     State' := 3 /\ K' := Gk(M.H(E))
+     /\ secret(K',kem_secret,{A,B})
+
+  % FO consistency fails: derive the implicit-rejection secret.
+  % This is not application acceptance and not a public error.
+  % Z is private to this initiator session; J(Z.C) depends on that seed
+  % and the received ciphertext. The role still proceeds to tag checking.
+  4. State = 2 /\ C /= Ccheck --|>
+     State' := 3 /\ K' := J(Z.C)
+     /\ secret(K',kem_secret,{A,B})
+
+  % Both decapsulation branches use the same KDF and MAC verification.
+  % Ks = Kdf(K || Ls || Ctx); Kc = Kdf(K || Lc || Ctx).
+  % Distinct Ls/Lc separate the session-key and confirmation-key purposes.
+  % Expected TagB = Mac(Kc || Lb || Ctx), with the B-to-A direction label.
+  5. State = 3 --|>
+     State' := 4
+     /\ Ks' := Kdf(K.Ls.Ctx)
+     /\ Kc' := Kdf(K.Lc.Ctx)
+     /\ TagBcheck' := Mac(Kc'.Lb.Ctx)
+     % session_key protects Ks (K^{sess}); confirmation_key protects Kc.
+     /\ secret(Ks',session_key,{A,B})
+     /\ secret(Kc',confirmation_key,{A,B})
+
+  % Verify B's tag, then send message 3 and accept locally.
+  % A local equality check is --|>; SND does not require another RCV.
+  % A mismatching tag has no accepting transition and produces no AuthConf.
+  6. State = 4 /\ TagB = TagBcheck --|>
+     State' := 5
+     % AuthConf_{i,j} = TagA = Mac(Kc || La || Ctx); La is A-to-B.
+     /\ SND(Mac(Kc.La.Ctx))
+     % Claim B's response authentication and confirmation only after TagB
+     % is verified. The final witness supplies B's matching AuthConf claim.
+     /\ request(A,B,res_agree,E.T1.T2.K)
+     /\ request(A,B,kc_b_to_a,Ctx.Ks.Kc)
+     /\ witness(A,B,kc_a_to_b,Ctx.Ks.Kc)
+end role
+
+% RESPONDER ROLE: the second avatar A_{k,l}, represented by agent B.
+% B verifies AuthReq, rejects replayed requests, encapsulates to A's E,
+% sends AuthRes with TagB, and waits for TagA before accepting.
+% CertB is B's pre-issued ACA certificate. Seen is the shared request
+% cache containing tuples (Ka,Da,Kb,Db,E,T1), not a cache of signatures.
+role responder(A,B: agent, Ka,Kb,Kaca: public_key,
+               Da,Db: text, CertB: message,
+               H,Gk,Gr,J,Kdf,Mac: hash_func,
+               Ls,Lc,La,Lb: text,
+               Seen: (public_key.text.public_key.text.public_key.text) set,
+               SND,RCV: channel(dy)) played_by B def=
+ % Local values store the request, encapsulation output, context, and keys
+ % needed later to verify the final confirmation for this specific session.
+ local State: nat, E: public_key, T1,T2,M: text,
+       R,C,K,Ctx,Ks,Kc: message
+ % States: 0=await AuthReq, 1=await AuthConf, 2=accepted after TagA check.
+ init State := 0
+ transition
+  % Verify message 1 and atomically record it in the shared replay cache.
+  % The receive pattern requires A's ACA certificate, the intended
+  % recipient identity, and A's signature on identities, E, and T1.
+  1. State = 0 /\
+     RCV({Ka.Da}_inv(Kaca).Ka.Da.Kb.Db.E'.T1'.
+         {Ka.Da.Kb.Db.E'.T1'}_inv(Ka))
+     % Guard plus update implements a single atomic check-and-insert.
+     /\ not(in(Ka.Da.Kb.Db.E'.T1',Seen)) =|>
+     Seen' := cons(Ka.Da.Kb.Db.E'.T1',Seen)
+     % Fresh M abstracts the encapsulated value; T2 is B's fresh timestamp.
+     /\ State' := 1 /\ M' := new() /\ T2' := new()
+     % Symbolic Encaps(E): K=Gk(M.H(E)), R=Gr(M.H(E)), C={M.R}_E.
+     /\ K' := Gk(M'.H(E'))
+     /\ R' := Gr(M'.H(E'))
+     /\ C' := {M'.R'}_E'
+     % Construct the same initiator-first context and purpose-separated keys.
+     /\ Ctx' := Ka.Da.Kb.Db.E'.C'.T1'.T2'
+     /\ Ks' := Kdf(K'.Ls.Ctx')
+     /\ Kc' := Kdf(K'.Lc.Ctx')
+     % Message 2 includes B's confirmation tag. B still waits for TagA.
+     % AuthRes_{k,l} = AC_{k,l} || TagB || IdAv_{k,l} || IdAv_{i,j}
+     %                 || C || T2 || Sign_B(IdAv_{k,l} || IdAv_{i,j}
+     %                                     || C || T2).
+     /\ SND(CertB.Mac(Kc'.Lb.Ctx').Kb.Db.Ka.Da.C'.T2'.
+            {Kb.Db.Ka.Da.C'.T2'}_inv(Kb))
+     % req_agree claims verified request authentication; the witnesses
+     % provide A's later response and B-to-A confirmation checks.
+     /\ request(B,A,req_agree,E'.T1')
+     /\ witness(B,A,res_agree,E'.T1'.T2'.K')
+     /\ witness(B,A,kc_b_to_a,Ctx'.Ks'.Kc')
+     % Register secrecy for the raw shared secret and both derived keys.
+     /\ secret(K',kem_secret,{A,B})
+     /\ secret(Ks',session_key,{A,B})
+     /\ secret(Kc',confirmation_key,{A,B})
+
+  % Message 3: exact MAC verification using B's stored key and context.
+  % The opposite direction label prevents reflection of B's own tag.
+  % AuthConf must equal Mac(Kc || La || Ctx). Only this receive advances
+  % B to its accepted state; an invalid/missing tag cannot complete B.
+  2. State = 1 /\ RCV(Mac(Kc.La.Ctx)) =|>
+     State' := 2
+     % Match A's kc_a_to_b witness on the same context and derived keys.
+     /\ request(B,A,kc_a_to_b,Ctx.Ks.Kc)
+end role
+
+% SESSION ROLE: run one initiator and one responder concurrently.
+% Both receive the same identities, certificates, symbolic functions,
+% and labels. Separate dy channels remain under adversary control;
+% Seen is passed to the responder so it can be shared across sessions.
+role session(A,B: agent, Ka,Kb,Kaca: public_key,
+             Da,Db: text, CertA,CertB: message,
+             H,Gk,Gr,J,Kdf,Mac: hash_func,
+             Ls,Lc,La,Lb: text,
+             Seen: (public_key.text.public_key.text.public_key.text) set) def=
+ % SA/RA are A's send/receive channels; SB/RB are B's channels.
+ local SA,RA,SB,RB: channel(dy)
+ composition
+  initiator(A,B,Ka,Kb,Kaca,Da,Db,CertA,H,Gk,Gr,J,Kdf,Mac,
+            Ls,Lc,La,Lb,SA,RA)
+  /\ responder(A,B,Ka,Kb,Kaca,Da,Db,CertB,H,Gk,Gr,J,Kdf,Mac,
+               Ls,Lc,La,Lb,Seen,SB,RB)
+end role
+
+% ENVIRONMENT ROLE: define public constants, initial adversary knowledge,
+% shared replay caches, and the bounded set of concurrent sessions.
+% Lower-case constants instantiate the upper-case role parameters.
+% Agent i is AVISPA's intruder; ki/di give it its own certified avatar.
+role environment() def=
+ % SeenB is shared by every responder played by b; SeenI is used when
+ % the intruder is the responder. Both caches start empty.
+ local SeenB,SeenI: (public_key.text.public_key.text.public_key.text) set
+ const a,b: agent, ka,kb,ki,kaca: public_key,
+       da,db,di: text, h,gk,gr,j,kdf,mac: hash_func,
+       key_session,key_confirmation,kc_initiator,kc_responder: text,
+       req_agree,res_agree,kc_b_to_a,kc_a_to_b,
+       kem_secret,session_key,confirmation_key: protocol_id
+ % key_session/key_confirmation instantiate Ls/Lc; kc_initiator and
+ % kc_responder instantiate La/Lb. Goal names label events, not key values.
+ init SeenB := {} /\ SeenI := {}
+ % Public identities, verification keys, functions, labels, and issued
+ % certificates are initially known. Only the intruder's private key,
+ % inv(ki), is disclosed; inv(ka), inv(kb), and inv(kaca) are not listed.
+ intruder_knowledge =
+  {a,b,i,ka,kb,ki,kaca,da,db,di,inv(ki),h,gk,gr,j,kdf,mac,
+   key_session,key_confirmation,kc_initiator,kc_responder,
+   {ka.da}_inv(kaca),{kb.db}_inv(kaca),{ki.di}_inv(kaca)}
+ composition
+  % Honest session 1: a initiates to b, using b's shared replay cache.
+  session(a,b,ka,kb,kaca,da,db,{ka.da}_inv(kaca),{kb.db}_inv(kaca),
+          h,gk,gr,j,kdf,mac,
+          key_session,key_confirmation,kc_initiator,kc_responder,SeenB)
+  % Honest session 2: concurrent reuse of the same peers and SeenB.
+  /\ session(a,b,ka,kb,kaca,da,db,{ka.da}_inv(kaca),{kb.db}_inv(kaca),
+             h,gk,gr,j,kdf,mac,
+             key_session,key_confirmation,kc_initiator,kc_responder,SeenB)
+  % Intruder as responder: honest a may establish a session with i.
+  % The intruder is an authorized peer for secrets of that session.
+  /\ session(a,i,ka,ki,kaca,da,di,{ka.da}_inv(kaca),{ki.di}_inv(kaca),
+             h,gk,gr,j,kdf,mac,
+             key_session,key_confirmation,kc_initiator,kc_responder,SeenI)
+  % Intruder as initiator: i may start a session with honest b.
+  % This responder also uses SeenB, preserving cross-session replay checks.
+  /\ session(i,b,ki,kb,kaca,di,db,{ki.di}_inv(kaca),{kb.db}_inv(kaca),
+             h,gk,gr,j,kdf,mac,
+             key_session,key_confirmation,kc_initiator,kc_responder,SeenB)
+end role
+
+% SECURITY GOALS
+goal
+ % Raw KEM shared-secret secrecy: events protect K.
+ secrecy_of kem_secret
+ % Derived session-key secrecy: events protect Ks = Kdf(K.Ls.Ctx).
+ secrecy_of session_key
+ % Derived confirmation-key secrecy: events protect Kc = Kdf(K.Lc.Ctx).
+ secrecy_of confirmation_key
+ % B authenticates A's request on E.T1.
+ authentication_on req_agree
+ % A authenticates B's response on E.T1.T2.K after validating TagB.
+ authentication_on res_agree
+ % A verifies B's agreement on Ctx.Ks.Kc using B's direction-specific tag.
+ authentication_on kc_b_to_a
+ % B verifies A's agreement on Ctx.Ks.Kc using the final AuthConf tag.
+ authentication_on kc_a_to_b
+end goal
+
+environment()
+
+
