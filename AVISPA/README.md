@@ -8,7 +8,7 @@ Keep these files in the same folder:
 
 | File | Purpose |
 | --- | --- |
-| [PUMA_Mutual_Auth_Key_Con.hlpsl](PUMA_Mutual_Auth_Key_Con.hlpsl) | Latest annotated model; reviewer comments added on October 14, 2026 |
+| [PUMA_Mutual_Auth_Key_Con.hlpsl](PUMA_Mutual_Auth_Key_Con.hlpsl) | Latest annotated model|
 | [PUMA_AVISPA_OFMC.png](PUMA_AVISPA_OFMC.png) | Recorded OFMC result from SPAN |
 | [PUMA_AVISPA_CL-AtSe.png](PUMA_AVISPA_CL-AtSe.png) | Recorded CL-AtSe result from SPAN |
 
